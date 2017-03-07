@@ -5,10 +5,14 @@ import com.amazonaws.services.cloudformation.AmazonCloudFormationClient
 import com.amazonaws.services.cloudformation.model.AmazonCloudFormationException
 import com.amazonaws.services.cloudformation.model.DeleteStackRequest
 import com.amazonaws.services.cloudformation.model.DescribeStacksRequest
+import com.amazonaws.services.s3.AmazonS3
+import com.amazonaws.services.s3.AmazonS3Client
+import com.amazonaws.services.s3.model.DeleteObjectsRequest
 import com.amazonaws.waiters.Waiter
 import com.amazonaws.waiters.WaiterParameters
-import com.fieldju.gradle.plugins.lambdasam.LambdaSamPlugin
+import com.fieldju.gradle.plugins.lambdasam.AwsSamDeployerPlugin
 import groovy.util.logging.Slf4j
+import org.gradle.api.logging.LogLevel
 import org.gradle.testfixtures.ProjectBuilder
 import org.junit.After
 import org.junit.Before
@@ -26,10 +30,13 @@ class DeploySamTaskIntegrationTest {
     String regionString
     String testStackName
     AmazonCloudFormation cloudFormation
+    AmazonS3 s3
+    String prefix
+    String bucket
 
     @Before
     void before() {
-        regionString = getRequiredTestParam('REGION', 'The region in which to upload the archive and execute the SAM CloudFormation')
+        regionString = 'us-west-2'
         testStackName = "DeploySamTaskIntegrationTest-${UUID.randomUUID()}"
         // Verify That the stack exists
         cloudFormation = AmazonCloudFormationClient.builder()
@@ -37,6 +44,10 @@ class DeploySamTaskIntegrationTest {
                 .withRegion(regionString)
                 .build() as AmazonCloudFormationClient
 
+        s3 = AmazonS3Client.builder().standard().withRegion(regionString).build()
+
+        prefix = "gradle-aws-sam-deployer-plugin-integration-test/${UUID.randomUUID().toString()}"
+        bucket = getRequiredTestParam('S3_BUCKET', 'The s3 bucket to upload the lambda fat jar')
         log.info("Integration Test stack name: ${testStackName}")
     }
 
@@ -48,6 +59,12 @@ class DeploySamTaskIntegrationTest {
             Waiter<DescribeStacksRequest> waiter = cloudFormation.waiters().stackDeleteComplete()
             waiter.run(new WaiterParameters<DescribeStacksRequest>(new DescribeStacksRequest().withStackName(testStackName)))
             log.info("Successfully deleted Test CloudFormation Stack")
+
+            List<String> keys = s3.listObjectsV2(bucket, prefix).getObjectSummaries().collect { it.key }
+            keys.each { key ->
+                log.info("Deleting test key: ${key}")
+                s3.deleteObjects(new DeleteObjectsRequest(bucket).withKeys(key))
+            }
         } catch (Throwable t) {
             log.error("Failed to delete stack: ${testStackName}, please ensure it gets cleaned up manually", t)
         }
@@ -66,12 +83,12 @@ class DeploySamTaskIntegrationTest {
         Files.copy(fatJarSource, fatJarDest)
 
         def project = ProjectBuilder.builder().withName('DeploySamTaskIntegrationTest').withProjectDir(temp).build()
-        LambdaSamPlugin plugin = new LambdaSamPlugin()
+        AwsSamDeployerPlugin plugin = new AwsSamDeployerPlugin()
         plugin.apply(project)
-        project.'lambdaSam' {
+        project.'aws-sam-deployer' {
             region = regionString
-            s3Bucket = getRequiredTestParam('S3_BUCKET', 'The s3 bucket to upload the lambda fat jar')
-            s3Prefix = getRequiredTestParam('S3_PREFIX', 'The prefix / folder to store the fat jar in')
+            s3Bucket = bucket
+            s3Prefix = prefix
             stackName = testStackName
             samTemplatePath = "${temp.absolutePath}${File.separator}application.yaml"
             tokenArtifactMap = [
@@ -84,10 +101,10 @@ class DeploySamTaskIntegrationTest {
         }
 
         // run the package sam task, since deploy depends on it
-        def packageSameTask = project.tasks.getByName(LambdaSamPlugin.TaskDefinitions.PACKAGE_SAM_TASK.name as String) as PackageSamTask
+        def packageSameTask = project.tasks.getByName(AwsSamDeployerPlugin.TaskDefinitions.PACKAGE_SAM_TASK.name as String) as PackageSamTask
         packageSameTask.taskAction()
         // deploy the sam
-        def deploySamTask = project.tasks.getByName(LambdaSamPlugin.TaskDefinitions.DEPLOY_SAM_TASK.name as String) as DeploySamTask
+        def deploySamTask = project.tasks.getByName(AwsSamDeployerPlugin.TaskDefinitions.DEPLOY_SAM_TASK.name as String) as DeploySamTask
         deploySamTask.taskAction()
 
         try {
